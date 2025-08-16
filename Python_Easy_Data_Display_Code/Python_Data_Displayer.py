@@ -6,28 +6,25 @@ from collections import deque
 import serial.tools.list_ports
 import numpy as np
 from dash.exceptions import PreventUpdate
-
-
 import plotly.graph_objs as go
 from dash import Dash, dcc, html, Output, Input, State
 
+# --- DIAGNOSTIC CONFIGURATION ---
+ENABLE_TERMINAL_DEBUG = True
+DEBUG_PRINT_INTERVAL_PACKETS = 250  # Print one full packet breakdown every 250 packets (approx. 1 per second)
+debug_packet_counter = 0
 
-# --- Configuration ---
+# --- General Configuration ---
 INITIAL_BAUD_RATE = 9600
+FINAL_BAUD_RATE = 115200
+FIRMWARE_BAUD_RATE_INDEX = 0x04
+SAMPLING_RATE_HZ = 250.0
 
-
-# Final, negotiated baud rate. 230400 is stable on macOS and other systems.
-FINAL_BAUD_RATE = 230400
-# The corresponding byte index to send in the handshake packet for 230400 bps.
-FIRMWARE_BAUD_RATE_INDEX = 0x05
-
-
-SAMPLING_RATE_HZ = 500.0
+# --- Plotting and FFT Constants ---
 FFT_BUFFER_SIZE = 15000
 TIME_SERIES_DEFAULT_SECONDS = 2
 TIME_SERIES_POINTS = int(TIME_SERIES_DEFAULT_SECONDS * SAMPLING_RATE_HZ)
 FFT_MAX_HZ = 100
-
 
 # --- Packet Structures ---
 DATA_PACKET_START_MARKER = 0xABCD
@@ -36,25 +33,25 @@ DATA_PACKET_TOTAL_SIZE = 37
 HANDSHAKE_START_MARKER_1 = 0xAA
 HANDSHAKE_END_MARKER_1 = 0xCC
 
+# Packet Indices
+PACKET_IDX_LENGTH = 2
+PACKET_IDX_CHECKSUM = 34
 
 # --- ADS1299 Config ---
 ADS1299_NUM_CHANNELS = 8
 ADS1299_NUM_STATUS_BYTES = 3
 ADS1299_BYTES_PER_CHANNEL = 3
 
-
 # --- Heuristics for Port Detection ---
 BOARD_USB_IDS = [{'vid': 0x1A86, 'pid': 0x7523}]
 BOARD_DESCRIPTIONS = ["USB-SERIAL CH340", "CH340"]
 
-
-# --- Data Buffers and Counters ---
+# --- Data Buffers ---
 fft_buffers = [deque(maxlen=FFT_BUFFER_SIZE) for _ in range(ADS1299_NUM_CHANNELS)]
 time_series_buffers = [deque(maxlen=TIME_SERIES_POINTS) for _ in range(ADS1299_NUM_CHANNELS)]
 band_power_history = {f"ch{ch}_{band}": deque(maxlen=100) for ch in range(ADS1299_NUM_CHANNELS) for band in ["Delta", "Theta", "Alpha", "Beta", "Gamma"]}
 buffer_lock = threading.Lock()
 total_sample_count = 0
-
 
 # --- Brainwave Frequency Bands ---
 BRAINWAVE_BANDS = {
@@ -65,23 +62,24 @@ BRAINWAVE_BANDS = {
     "Gamma": ([30, FFT_MAX_HZ], "hsl(175, 56%, 50%)", "(Insight)"),
 }
 
-
 # --- Helper Functions ---
 def convert_to_microvolts(raw_val, vref=4.5, gain=24):
-    scale_factor = (vref * 2) / (gain * (2**24))
+    """
+    Converts the raw 24-bit integer from the ADS1299 to microvolts.
+    This formula matches the known-working C++ driver for consistency.
+    """
+    scale_factor = (2 * vref / gain) / (2**24)
     return raw_val * scale_factor * 1_000_000
 
-
 def parse_data_packet(packet):
+    """Parses a validated 37-byte data packet and updates the data buffers."""
     global total_sample_count
     try:
-        # Correctly slice the 27-byte ADS data block from the full packet.
         ads_data = packet[7:34]
         with buffer_lock:
             total_sample_count += 1
             current_time_s = total_sample_count / SAMPLING_RATE_HZ
             for ch in range(ADS1299_NUM_CHANNELS):
-                # Correctly calculate index relative to the start of the `ads_data` slice.
                 idx = ADS1299_NUM_STATUS_BYTES + ch * ADS1299_BYTES_PER_CHANNEL
                 raw_bytes = ads_data[idx:idx + ADS1299_BYTES_PER_CHANNEL]
                 value = int.from_bytes(raw_bytes, byteorder='big', signed=True)
@@ -91,35 +89,25 @@ def parse_data_packet(packet):
     except Exception as e:
         print(f"Error parsing packet: {e}")
 
-
-# Solution Pillar 1: Stable connection logic that opens the port only once.
 def find_and_open_board():
+    """Scans serial ports, connects, and negotiates the final baud rate."""
     print("Searching for the ADS1299 board...")
     ports = serial.tools.list_ports.comports()
     candidate_ports = [p.device for p in ports if (p.vid and p.pid and {'vid': p.vid, 'pid': p.pid} in BOARD_USB_IDS) or \
                        (p.description and any(desc.lower() in p.description.lower() for desc in BOARD_DESCRIPTIONS))]
     if not candidate_ports:
-        print("No candidate ports found. Testing all available ports...")
+        print("No specific candidate ports found. Testing all available serial ports...")
         candidate_ports = [p.device for p in ports]
-
 
     for port_name in candidate_ports:
         print(f"--- Testing port: {port_name} ---")
         ser = None
         try:
-            # Open port, which resets the board.
             ser = serial.Serial(port_name, INITIAL_BAUD_RATE, timeout=2)
-            print("Port opened. Waiting 4 seconds for board to initialize...")
-            time.sleep(4)
-            
-            # Discard any bootup messages from the firmware.
-            bytes_in_buffer = ser.in_waiting
-            if bytes_in_buffer > 0:
-                ser.read(bytes_in_buffer)
-                print(f"Discarded {bytes_in_buffer} bytes of startup messages.")
+            print("Port opened. Waiting 5 seconds for board to initialize...")
+            time.sleep(5)
+            if ser.in_waiting > 0: ser.read(ser.in_waiting)
 
-
-            # Perform the handshake to negotiate the final baud rate.
             print(f"Sending handshake to negotiate baud rate: {FINAL_BAUD_RATE} bps...")
             current_unix_time = int(time.time())
             checksum_payload = struct.pack('>BI', 0x02, current_unix_time) + bytes([0x01, FIRMWARE_BAUD_RATE_INDEX])
@@ -128,39 +116,32 @@ def find_and_open_board():
             ser.write(handshake_packet)
             time.sleep(0.1)
             
-            # Switch the Python serial object to the new baud rate.
             ser.baudrate = FINAL_BAUD_RATE
-            time.sleep(0.1)
+            print(f"Switched to {ser.baudrate} baud. Waiting for stream to stabilize...")
+            time.sleep(0.5)
             ser.reset_input_buffer()
             
-            # Verify that the board is now sending data packets correctly.
-            print(f"Switched to {ser.baudrate} baud. Verifying data stream...")
+            print("Verifying data stream...")
             bytes_received = ser.read(DATA_PACKET_TOTAL_SIZE * 5)
             if bytes_received and DATA_PACKET_START_MARKER.to_bytes(2, 'big') in bytes_received:
                 print(f"Success! Board found and streaming on port: {port_name}")
-                return ser # Return the live, open serial port object.
+                return ser
             else:
                 print("Handshake sent, but no valid data stream detected.")
                 ser.close()
-
-
         except serial.SerialException as e:
             print(f"Could not test port {port_name}: {e}")
-            if ser and ser.is_open:
-                ser.close()
-                
-    print("ADS1299 board not found after testing all candidate ports.")
+            if ser and ser.is_open: ser.close()
     return None
 
-
-# Solution Pillar 2: Robust serial loop that validates the entire packet frame.
 def serial_read_loop(ser):
+    """Reads data from the serial port, validates, and prints debug info."""
+    global debug_packet_counter
     if not ser: return
     
     buffer = bytearray()
     start_marker = DATA_PACKET_START_MARKER.to_bytes(2, 'big')
     end_marker = DATA_PACKET_END_MARKER.to_bytes(2, 'big')
-
 
     try:
         while True:
@@ -170,7 +151,6 @@ def serial_read_loop(ser):
                 continue
             buffer.extend(data)
 
-
             while True:
                 start_idx = buffer.find(start_marker)
                 if start_idx == -1: break
@@ -179,34 +159,59 @@ def serial_read_loop(ser):
                     if start_idx > 0: buffer = buffer[start_idx:]
                     break
 
-
                 potential_packet = buffer[start_idx : start_idx + DATA_PACKET_TOTAL_SIZE]
                 
-                # The critical step: validate the end marker before parsing.
                 if potential_packet.endswith(end_marker):
-                    parse_data_packet(potential_packet)
-                    # Consume the valid packet from the buffer.
+                    payload_for_checksum = potential_packet[PACKET_IDX_LENGTH:PACKET_IDX_CHECKSUM]
+                    calculated_checksum = sum(payload_for_checksum) & 0xFF
+                    received_checksum = potential_packet[PACKET_IDX_CHECKSUM]
+
+                    if calculated_checksum == received_checksum:
+                        debug_packet_counter += 1
+                        
+                        # --- START OF DEBUG BLOCK ---
+                        if ENABLE_TERMINAL_DEBUG and (debug_packet_counter % DEBUG_PRINT_INTERVAL_PACKETS == 0):
+                            print(f"\n--- [DEBUG] Valid Packet #{debug_packet_counter} ---")
+                            hex_string = ' '.join(f'{b:02x}' for b in potential_packet)
+                            print(f"Raw Bytes ({len(potential_packet)}): {hex_string}")
+                            print(f"Checksum OK: 0x{received_checksum:02x}")
+                            
+                            ads_data = potential_packet[7:34]
+                            print("--- Channel Data Breakdown ---")
+                            for ch in range(ADS1299_NUM_CHANNELS):
+                                idx = ADS1299_NUM_STATUS_BYTES + ch * ADS1299_BYTES_PER_CHANNEL
+                                raw_bytes = ads_data[idx:idx + ADS1299_BYTES_PER_CHANNEL]
+                                value = int.from_bytes(raw_bytes, byteorder='big', signed=True)
+                                microvolts = convert_to_microvolts(value)
+                                
+                                ch_hex_bytes = ' '.join(f'{b:02x}' for b in raw_bytes)
+                                print(f"  Ch {ch}: Bytes: [{ch_hex_bytes}] -> Raw Int: {value:<10} -> uV: {microvolts:.2f}")
+                            print("--------------------------------")
+                        # --- END OF DEBUG BLOCK ---
+
+                        # Still parse the packet to update the Dash GUI
+                        parse_data_packet(potential_packet)
+                    else:
+                        if ENABLE_TERMINAL_DEBUG:
+                            print(f"Checksum mismatch! Expected: 0x{calculated_checksum:02x}, Got: 0x{received_checksum:02x}. Discarding.")
+                    
                     buffer = buffer[start_idx + DATA_PACKET_TOTAL_SIZE:]
                 else:
-                    # This was a false start. Discard the first byte and search again.
                     buffer = buffer[start_idx + 1:]
-
 
     except serial.SerialException as e:
         print(f"Serial Error during read loop: {e}")
     finally:
-        ser.close()
-        print("Serial port closed.")
+        if ser.is_open:
+            ser.close()
+            print("Serial port closed.")
 
-
-# --- Dash App Layout and Callbacks (Unchanged) ---
+# --- Dash App Layout and Callbacks (Largely Unchanged) ---
 app = Dash(__name__)
 app.title = "Cerelog 8-Channel EEG Data Logger"
 
-
 def create_initial_figure(title="Waiting for data...", y_axis_title="Amplitude (μV)"):
     fig = go.Figure(); fig.update_layout(title=title, yaxis_title=y_axis_title, margin=dict(l=60, r=20, t=50, b=50)); return fig
-
 
 app.layout = html.Div(style={'backgroundColor': '#f0f2f5', 'fontFamily': 'Arial, sans-serif', 'padding': '20px'}, children=[
     html.H1("Cerelog: 8-Channel Brain-Computer Interface EEG Data Log", style={'textAlign': 'center', 'color': '#333333', 'marginBottom': '30px', 'fontSize': '2.5em', 'fontWeight': 'bold'}),
@@ -221,7 +226,6 @@ app.layout = html.Div(style={'backgroundColor': '#f0f2f5', 'fontFamily': 'Arial,
     dcc.Interval(id='fast-interval-time-series', interval=500, n_intervals=0),
     dcc.Interval(id='slow-interval-fft', interval=2000, n_intervals=0),
 ])
-
 
 def generate_time_series_callback(ch_idx):
     @app.callback(Output(f'channel-graph-{ch_idx+1}', 'figure'), Input('fast-interval-time-series', 'n_intervals'), State(f'channel-graph-{ch_idx+1}', 'relayoutData'))
@@ -241,7 +245,6 @@ def generate_time_series_callback(ch_idx):
         return fig
     return update_time_series
 
-
 def generate_fft_callback(ch_idx):
     @app.callback(Output(f'fft-div-{ch_idx+1}', 'children'), Input('slow-interval-fft', 'n_intervals'))
     def update_fft(n):
@@ -258,37 +261,24 @@ def generate_fft_callback(ch_idx):
             power = np.mean(amplitude[band_mask]) if np.any(band_mask) else 0
             history_key = f"ch{ch_idx}_{band}"; band_power_history[history_key].append(power)
             min_power = min(band_power_history[history_key]); max_power = max(band_power_history[history_key]) if max(band_power_history[history_key]) > 0.1 else 1
-            gauge_fig = go.Figure(go.Indicator(
-                mode="gauge+number", value=power,
-                domain={'x': [0, 1], 'y': [0, 1]},
-                title={'text': f"<b>{band}</b><br>{description}", 'font': {'size': 16}},
-                number={'suffix': " μV", 'font': {'size': 28}, 'valueformat': '.2f'},
-                gauge={'axis': {'range': [min_power, max_power]}, 'bar': {'color': color, 'thickness': 0.75}}))
+            gauge_fig = go.Figure(go.Indicator(mode="gauge+number", value=power, domain={'x': [0, 1], 'y': [0, 1]}, title={'text': f"<b>{band}</b><br>{description}", 'font': {'size': 16}}, number={'suffix': " μV", 'font': {'size': 28}, 'valueformat': '.2f'}, gauge={'axis': {'range': [min_power, max_power]}, 'bar': {'color': color, 'thickness': 0.75}}))
             gauge_fig.update_layout(height=200, margin=dict(l=20, r=20, t=50, b=20), uirevision=f'fft-gauge-{ch_idx}-{band}')
             gauge_row.append(html.Div(dcc.Graph(figure=gauge_fig), style={'width': '33%', 'minWidth': '150px'}))
         gauges.append(html.Div(gauge_row, style={'display': 'flex', 'flexWrap': 'wrap', 'justifyContent': 'center'}))
         return gauges
     return update_fft
 
-
 for i in range(ADS1299_NUM_CHANNELS):
     generate_time_series_callback(i)
     generate_fft_callback(i)
 
-
 def main():
     serial_port_object = find_and_open_board()
     if serial_port_object:
-        # Start the robust reading loop in a separate thread.
         threading.Thread(target=serial_read_loop, args=(serial_port_object,), daemon=True).start()
-        # Run the Dash web application.
         app.run(debug=True, use_reloader=False)
     else:
         print("Could not start application: No board was found or data stream failed verification.")
 
-
 if __name__ == "__main__":
     main()
-
-
-
