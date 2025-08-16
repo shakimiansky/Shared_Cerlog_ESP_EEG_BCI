@@ -5,20 +5,17 @@ import time
 from collections import deque
 import serial.tools.list_ports
 import numpy as np
+import logging
 from dash.exceptions import PreventUpdate
 import plotly.graph_objs as go
 from dash import Dash, dcc, html, Output, Input, State
-
-# --- DIAGNOSTIC CONFIGURATION ---
-ENABLE_TERMINAL_DEBUG = True
-DEBUG_PRINT_INTERVAL_PACKETS = 250  # Print one full packet breakdown every 250 packets (approx. 1 per second)
-debug_packet_counter = 0
 
 # --- General Configuration ---
 INITIAL_BAUD_RATE = 9600
 FINAL_BAUD_RATE = 115200
 FIRMWARE_BAUD_RATE_INDEX = 0x04
 SAMPLING_RATE_HZ = 250.0
+STREAM_TIMEOUT_SECONDS = 5.0
 
 # --- Plotting and FFT Constants ---
 FFT_BUFFER_SIZE = 15000
@@ -64,15 +61,10 @@ BRAINWAVE_BANDS = {
 
 # --- Helper Functions ---
 def convert_to_microvolts(raw_val, vref=4.5, gain=24):
-    """
-    Converts the raw 24-bit integer from the ADS1299 to microvolts.
-    This formula matches the known-working C++ driver for consistency.
-    """
     scale_factor = (2 * vref / gain) / (2**24)
     return raw_val * scale_factor * 1_000_000
 
 def parse_data_packet(packet):
-    """Parses a validated 37-byte data packet and updates the data buffers."""
     global total_sample_count
     try:
         ads_data = packet[7:34]
@@ -90,7 +82,6 @@ def parse_data_packet(packet):
         print(f"Error parsing packet: {e}")
 
 def find_and_open_board():
-    """Scans serial ports, connects, and negotiates the final baud rate."""
     print("Searching for the ADS1299 board...")
     ports = serial.tools.list_ports.comports()
     candidate_ports = [p.device for p in ports if (p.vid and p.pid and {'vid': p.vid, 'pid': p.pid} in BOARD_USB_IDS) or \
@@ -107,7 +98,6 @@ def find_and_open_board():
             print("Port opened. Waiting 5 seconds for board to initialize...")
             time.sleep(5)
             if ser.in_waiting > 0: ser.read(ser.in_waiting)
-
             print(f"Sending handshake to negotiate baud rate: {FINAL_BAUD_RATE} bps...")
             current_unix_time = int(time.time())
             checksum_payload = struct.pack('>BI', 0x02, current_unix_time) + bytes([0x01, FIRMWARE_BAUD_RATE_INDEX])
@@ -115,12 +105,10 @@ def find_and_open_board():
             handshake_packet = struct.pack('>BB', HANDSHAKE_START_MARKER_1, 0xBB) + checksum_payload + struct.pack('>B', checksum) + struct.pack('>BB', HANDSHAKE_END_MARKER_1, 0xDD)
             ser.write(handshake_packet)
             time.sleep(0.1)
-            
             ser.baudrate = FINAL_BAUD_RATE
             print(f"Switched to {ser.baudrate} baud. Waiting for stream to stabilize...")
             time.sleep(0.5)
             ser.reset_input_buffer()
-            
             print("Verifying data stream...")
             bytes_received = ser.read(DATA_PACKET_TOTAL_SIZE * 5)
             if bytes_received and DATA_PACKET_START_MARKER.to_bytes(2, 'big') in bytes_received:
@@ -135,22 +123,27 @@ def find_and_open_board():
     return None
 
 def serial_read_loop(ser):
-    """Reads data from the serial port, validates, and prints debug info."""
-    global debug_packet_counter
     if not ser: return
     
     buffer = bytearray()
     start_marker = DATA_PACKET_START_MARKER.to_bytes(2, 'big')
     end_marker = DATA_PACKET_END_MARKER.to_bytes(2, 'big')
-
+    last_data_time = time.time()
+    
     try:
         while True:
-            data = ser.read(ser.in_waiting or 1)
-            if not data:
-                time.sleep(0.001)
-                continue
-            buffer.extend(data)
+            if time.time() - last_data_time > STREAM_TIMEOUT_SECONDS:
+                print(f"\nStream timed out. No data received for {STREAM_TIMEOUT_SECONDS} seconds.")
+                break
 
+            # Check if there is data in the buffer to avoid unnecessary reads
+            if ser.in_waiting > 0:
+                data = ser.read(ser.in_waiting)
+                buffer.extend(data)
+            else:
+                time.sleep(0.005) # Sleep briefly to prevent busy-waiting
+                continue
+            
             while True:
                 start_idx = buffer.find(start_marker)
                 if start_idx == -1: break
@@ -167,33 +160,8 @@ def serial_read_loop(ser):
                     received_checksum = potential_packet[PACKET_IDX_CHECKSUM]
 
                     if calculated_checksum == received_checksum:
-                        debug_packet_counter += 1
-                        
-                        # --- START OF DEBUG BLOCK ---
-                        if ENABLE_TERMINAL_DEBUG and (debug_packet_counter % DEBUG_PRINT_INTERVAL_PACKETS == 0):
-                            print(f"\n--- [DEBUG] Valid Packet #{debug_packet_counter} ---")
-                            hex_string = ' '.join(f'{b:02x}' for b in potential_packet)
-                            print(f"Raw Bytes ({len(potential_packet)}): {hex_string}")
-                            print(f"Checksum OK: 0x{received_checksum:02x}")
-                            
-                            ads_data = potential_packet[7:34]
-                            print("--- Channel Data Breakdown ---")
-                            for ch in range(ADS1299_NUM_CHANNELS):
-                                idx = ADS1299_NUM_STATUS_BYTES + ch * ADS1299_BYTES_PER_CHANNEL
-                                raw_bytes = ads_data[idx:idx + ADS1299_BYTES_PER_CHANNEL]
-                                value = int.from_bytes(raw_bytes, byteorder='big', signed=True)
-                                microvolts = convert_to_microvolts(value)
-                                
-                                ch_hex_bytes = ' '.join(f'{b:02x}' for b in raw_bytes)
-                                print(f"  Ch {ch}: Bytes: [{ch_hex_bytes}] -> Raw Int: {value:<10} -> uV: {microvolts:.2f}")
-                            print("--------------------------------")
-                        # --- END OF DEBUG BLOCK ---
-
-                        # Still parse the packet to update the Dash GUI
                         parse_data_packet(potential_packet)
-                    else:
-                        if ENABLE_TERMINAL_DEBUG:
-                            print(f"Checksum mismatch! Expected: 0x{calculated_checksum:02x}, Got: 0x{received_checksum:02x}. Discarding.")
+                        last_data_time = time.time()
                     
                     buffer = buffer[start_idx + DATA_PACKET_TOTAL_SIZE:]
                 else:
@@ -202,11 +170,11 @@ def serial_read_loop(ser):
     except serial.SerialException as e:
         print(f"Serial Error during read loop: {e}")
     finally:
-        if ser.is_open:
+        if ser and ser.is_open:
             ser.close()
             print("Serial port closed.")
 
-# --- Dash App Layout and Callbacks (Largely Unchanged) ---
+# --- Dash App Layout and Callbacks ---
 app = Dash(__name__)
 app.title = "Cerelog 8-Channel EEG Data Logger"
 
@@ -275,10 +243,37 @@ for i in range(ADS1299_NUM_CHANNELS):
 def main():
     serial_port_object = find_and_open_board()
     if serial_port_object:
-        threading.Thread(target=serial_read_loop, args=(serial_port_object,), daemon=True).start()
-        app.run(debug=True, use_reloader=False)
+        # Create and start the serial reader thread
+        read_thread = threading.Thread(target=serial_read_loop, args=(serial_port_object,))
+        read_thread.start()
+
+        # Create and start the Dash server in a daemon thread.
+        # This allows the main thread to remain free to monitor the reader thread.
+        # A daemon thread will be killed automatically when the main program exits.
+        dash_thread = threading.Thread(
+            target=lambda: app.run(debug=False, use_reloader=False),
+            daemon=True
+        )
+        dash_thread.start()
+
+        # Silence the default Dash/Flask server logs to keep the terminal clean
+        log = logging.getLogger('werkzeug')
+        log.setLevel(logging.ERROR)
+        
+        print("\nDash server is running. Open http://127.0.0.1:8050/ in your browser.")
+        print("The application will automatically shut down if the data stream is lost.")
+
+        # The main thread now waits here. Its only job is to check if the
+        # serial reader thread is still alive.
+        while read_thread.is_alive():
+            time.sleep(1)
+
+        # If the loop exits, it means the read_thread has finished (due to timeout or error).
+        # The main thread can now clean up and exit.
     else:
         print("Could not start application: No board was found or data stream failed verification.")
+
+    print("Application finished.")
 
 if __name__ == "__main__":
     main()
